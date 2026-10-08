@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import traceback
 from io import StringIO
 from typing import List
@@ -10,9 +11,9 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
+
 app = FastAPI()
 
-# CORS is required for testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,10 +32,6 @@ class ErrorAnalysis(BaseModel):
 
 
 def execute_python_code(code: str) -> dict:
-    """
-    Execute Python code and return exact stdout or traceback.
-    """
-
     old_stdout = sys.stdout
     sys.stdout = StringIO()
 
@@ -60,25 +57,39 @@ def execute_python_code(code: str) -> dict:
         sys.stdout = old_stdout
 
 
+def get_line_from_traceback(traceback_text: str) -> List[int]:
+    """
+    Extract Python source-code line numbers from a traceback.
+    """
+
+    lines = re.findall(
+        r'File ".*?", line (\d+)',
+        traceback_text
+    )
+
+    if not lines:
+        return []
+
+    return [int(lines[-1])]
+
+
 def analyze_error_with_ai(code: str, traceback_text: str) -> List[int]:
-    """
-    Use Gemini structured output to identify the exact error line.
-    """
 
     api_key = os.environ.get("GEMINI_API_KEY")
 
-    if not api_key:
-        return []
+    # Try AI analysis first
+    if api_key:
 
-    client = genai.Client(api_key=api_key)
+        try:
+            client = genai.Client(api_key=api_key)
 
-    prompt = f"""
-Analyze the following Python code and its error traceback.
+            prompt = f"""
+Analyze this Python code and traceback.
 
-Identify the exact source code line number or line numbers
+Identify the exact source-code line number or line numbers
 where the error occurred.
 
-Return only the line numbers where the error is located.
+Return the line numbers in the required JSON structure.
 
 CODE:
 {code}
@@ -87,29 +98,38 @@ TRACEBACK:
 {traceback_text}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-exp",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "error_lines": types.Schema(
-                        type=types.Type.ARRAY,
-                        items=types.Schema(
-                            type=types.Type.INTEGER
-                        )
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-exp",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "error_lines": types.Schema(
+                                type=types.Type.ARRAY,
+                                items=types.Schema(
+                                    type=types.Type.INTEGER
+                                )
+                            )
+                        },
+                        required=["error_lines"]
                     )
-                },
-                required=["error_lines"]
+                )
             )
-        )
-    )
 
-    result = ErrorAnalysis.model_validate_json(response.text)
+            result = ErrorAnalysis.model_validate_json(
+                response.text
+            )
 
-    return result.error_lines
+            if result.error_lines:
+                return result.error_lines
+
+        except Exception:
+            pass
+
+    # Reliable fallback using the exact Python traceback.
+    return get_line_from_traceback(traceback_text)
 
 
 @app.get("/")
@@ -124,14 +144,14 @@ def code_interpreter(request: CodeRequest):
 
     execution = execute_python_code(request.code)
 
-    # Successful execution
+    # No error
     if execution["success"]:
         return {
             "error": [],
             "result": execution["output"]
         }
 
-    # Error occurred: ask AI for exact line numbers
+    # Error occurred
     error_lines = analyze_error_with_ai(
         request.code,
         execution["output"]
